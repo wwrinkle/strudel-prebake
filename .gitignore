@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Local Claude Code settings (personal, not shared)
+.claude/settings.local.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*~

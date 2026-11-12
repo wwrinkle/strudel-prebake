@@ -1,0 +1,448 @@
+// Prebake script
+//
+// This is code that is loaded before your pattern is run.
+// You can use it to define custom functions to use in any pattern.
+// 
+// This is an initial example script. You can edit it to add 
+// your own funtions.
+//
+// To use a script shared by some other user you can use
+// the import-button or paste the script in this editor.
+
+// big ups to @ilesinge for the looper code, which is included here with some modifications
+// See original at https://strudel.cc/?uxBZTiojsEW8
+
+// Usage:
+// Record each cycle from the default audio interface
+// s("looper")
+// Output the last recorded cycle
+// s("loop")
+// Give the loop another sample name
+// s("looper ~ cheese").loopName("cheese")
+// Give the loop a specific sample number
+// s("looper:0 looper:1")
+
+// It could be used to sample other software's output
+// by plugging in a virtual audio interface (see TODO below)
+
+// Note: a rest is needed between the looper and the loop
+// otherwise the sample is not yet recorded or overwritten
+// so it takes the previous cycle's recording
+
+// Ask which audio input to record from. window.stream is left null
+// when there are no inputs, the user picks "none", or access fails.
+async function chooseAudioInput() {
+  const inputs = async () =>
+    (await navigator.mediaDevices.enumerateDevices())
+      .filter((d) => d.kind === 'audioinput');
+
+  // Before permission is granted, devices are listed without labels,
+  // but an empty list still means nothing is plugged in.
+  if ((await inputs()).length === 0) return null;
+
+  // Get permission once so device labels are visible, then release it.
+  if ((await inputs()).some((d) => !d.label)) {
+    const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
+    probe.getTracks().forEach((t) => t.stop());
+  }
+
+  const devices = await inputs();
+  if (devices.length === 0) return null;
+
+  const list = devices
+    .map((d, i) => (i + 1) + ': ' + (d.label || 'Input ' + (i + 1)))
+    .join('\n');
+  // Strudel treats backtick and double-quoted strings as mini-notation,
+  // so only single-quoted strings are used here.
+  const answer = prompt(
+    'Looper: choose an audio input\n\n0: None (no audio input)\n' + list,
+    '1',
+  );
+  const choice = parseInt(answer, 10);
+  if (!(choice >= 1 && choice <= devices.length)) return null;
+
+  return navigator.mediaDevices.getUserMedia({
+    video: false,
+    audio: {
+      deviceId: { exact: devices[choice - 1].deviceId },
+      // Turn off voice-call processing: it adds delay and squashes
+      // instruments.
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+      channelCount: { ideal: 2 },
+      latency: { ideal: 0 },
+    },
+  });
+}
+
+window.stream = await chooseAudioInput().catch((error) => {
+  console.log(error);
+  return null;
+});
+
+let loopers = {};
+
+createParam('loopName');
+Pattern.prototype['lname'] = Pattern.prototype['loopName'];
+
+
+registerSound('looper', (time, value, onended) => {
+  const ctx = getAudioContext();
+  const n = value.n || 0;
+  const loopName = value.loopName || 'loop';
+  const duration = value.duration; // seconds
+  loopers[loopName] = loopers[loopName] || [];
+
+  // silent placeholder node so superdough has something to connect
+  const node = ctx.createGain();
+  node.gain.value = 0;
+
+  if (!window.stream) {
+    console.log('looper: no audio input selected, nothing recorded');
+    return { node, stop: () => {} };
+  }
+
+  const recorder = new MediaRecorder(window.stream);
+  const chunks = [];
+  recorder.ondataavailable = (e) => chunks.push(e.data);
+  recorder.onstop = () => {
+    const blob = new Blob(chunks, { type: recorder.mimeType });
+    loopers[loopName][n] = URL.createObjectURL(blob);
+    registerSound(
+      loopName,
+      (t, hv, oe) => onTriggerSample(t, hv, oe, loopers[loopName]),
+      { type: 'sample', samples: loopers[loopName] },
+    );
+    console.log('registered', loopName, loopers[loopName]);
+  };
+
+  const startDelay = Math.max(0, (time - ctx.currentTime) * 1000);
+  setTimeout(() => recorder.start(), startDelay);
+  setTimeout(() => {
+    if (recorder.state === 'recording') recorder.stop();
+  }, startDelay + duration * 1000);
+
+  return { node, stop: () => {} };
+});
+
+// Todo:
+// - streams should be started by looper
+// - store a stream per chosen deviceid
+
+
+// ------------------------------------------------------------------
+// s("in")  live audio input through Strudel effects
+//
+// Plays the audio input chosen at startup, so any effect works on it:
+// $: s("in").distort(3).lpf(2000).room(.4)
+// $: s("in*8").shape(.6).crush(6).tweak('guitar')   // rhythmic gating
+//
+// - s("in") mixes all input channels to mono.
+// - s("in:1"), s("in:2") ... use just that input channel, e.g. when
+//   your guitar is plugged into input 1 of a 2-channel interface.
+// - Each event opens the input for its length, with attack, decay,
+//   sustain and release. One event per cycle (s("in")) gives a
+//   continuous signal.
+// - Use headphones with a mic, or you'll get feedback.
+// ------------------------------------------------------------------
+
+// One shared source per audio context; each event taps into it.
+function liveInput() {
+  const ctx = getAudioContext();
+  const live = window._liveIn;
+  if (live && live.ctx === ctx && live.stream === window.stream) return live;
+  if (live) live.source.disconnect();
+
+  const source = ctx.createMediaStreamSource(window.stream);
+  const mono = ctx.createGain();
+  mono.channelCount = 1;
+  mono.channelCountMode = 'explicit';
+  mono.channelInterpretation = 'speakers';
+  const splitter = ctx.createChannelSplitter(8);
+  source.connect(mono);
+  source.connect(splitter);
+
+  window._liveIn = { ctx, stream: window.stream, source, mono, splitter };
+  return window._liveIn;
+}
+
+// Envelope level at time t (seconds after the event starts).
+function liveInLevel(t, a, d, s) {
+  if (t < a) return t / a;
+  if (t < a + d) return 1 + (s - 1) * ((t - a) / d);
+  return s;
+}
+
+registerSound('in', (begin, value, onended) => {
+  if (!window.stream) {
+    if (!window._liveInWarned) console.log('in: no audio input selected');
+    window._liveInWarned = true;
+    return; // nothing returned = event is skipped
+  }
+  const ctx = getAudioContext();
+  const live = liveInput();
+  const channel = Math.min(Math.max(Math.floor(value.n || 0), 0), 8);
+
+  const [a, d, s, r] = getADSRValues(
+    [value.attack, value.decay, value.sustain, value.release],
+    'linear',
+    [0.005, 0.001, 1, 0.02],
+  );
+  const hold = value.duration;
+  const holdEnd = begin + hold;
+  const end = holdEnd + r;
+
+  // Gate the input with the ADSR envelope.
+  const env = ctx.createGain();
+  const g = env.gain;
+  g.setValueAtTime(0, begin);
+  if (a + d < hold) {
+    g.linearRampToValueAtTime(1, begin + a);
+    g.linearRampToValueAtTime(s, begin + a + d);
+    g.setValueAtTime(s, holdEnd);
+  } else {
+    // Note ends during attack/decay: ramp to wherever the envelope is then.
+    if (a < hold) g.linearRampToValueAtTime(1, begin + a);
+    g.linearRampToValueAtTime(liveInLevel(hold, a, d, s), holdEnd);
+  }
+  g.linearRampToValueAtTime(0, end);
+
+  if (channel === 0) live.mono.connect(env);
+  else live.splitter.connect(env, channel - 1);
+
+  const timeout = webAudioTimeout(
+    ctx,
+    () => {
+      if (channel === 0) live.mono.disconnect(env);
+      else live.splitter.disconnect(env, channel - 1);
+      onended();
+    },
+    begin,
+    end,
+  );
+
+  return { node: env, stop: (time) => timeout.stop(time) };
+});
+
+
+// ------------------------------------------------------------------
+// .tweak(name)
+//
+// Adds a floating panel with sliders for attack, decay, sustain,
+// release, gain, pan, room and roomsize, plus a scope of the pattern.
+// Moving a slider changes the sound right away, no re-evaluation needed.
+//
+// $: note("0 1 2 3").scale('f:major').s('sawtooth').tweak()
+// $: s("bd sd").tweak('drums')   // each name gets its own panel
+//
+// - Calls without a name share one panel.
+// - Slider positions are kept when you re-evaluate.
+// - Double-click a slider to reset it. Click the title to collapse,
+//   drag the title bar to move, x to close (it comes back on next eval).
+// - The scope shows the sound before the reverb, so the room tail
+//   is not drawn.
+// ------------------------------------------------------------------
+
+const TWEAK_PARAMS = [
+  { group: 'ADSR' },
+  { key: 'attack', min: 0, max: 2, step: 0.001, value: 0.01 },
+  { key: 'decay', min: 0, max: 2, step: 0.001, value: 0.1 },
+  { key: 'sustain', min: 0, max: 1, step: 0.01, value: 1 },
+  { key: 'release', min: 0, max: 4, step: 0.001, value: 0.1 },
+  { group: 'Mix' },
+  { key: 'gain', min: 0, max: 1.5, step: 0.01, value: 1 },
+  { key: 'pan', min: 0, max: 1, step: 0.01, value: 0.5 },
+  { group: 'Reverb' },
+  { key: 'room', min: 0, max: 1, step: 0.01, value: 0 },
+  { key: 'roomsize', min: 0, max: 10, step: 0.1, value: 1 },
+];
+
+// Kept on window so panels and slider values survive re-evaluation.
+window._tweak = window._tweak || { panels: {}, drawing: false };
+
+function tweakEl(tag, style, text) {
+  const el = document.createElement(tag);
+  Object.assign(el.style, style || {});
+  if (text != null) el.textContent = text;
+  return el;
+}
+
+function tweakFormat(p, v) {
+  if (p.key === 'pan') {
+    if (Math.abs(v - 0.5) < 0.005) return 'C';
+    return (v < 0.5 ? 'L' : 'R') + Math.round(Math.abs(v - 0.5) * 200);
+  }
+  return v < 10 ? v.toFixed(p.step < 0.01 ? 3 : 2) : v.toFixed(1);
+}
+
+function tweakBuildPanel(name, values) {
+  const openPanels = Object.values(window._tweak.panels)
+    .filter((p) => document.body.contains(p.el)).length;
+
+  const el = tweakEl('div', {
+    position: 'fixed',
+    top: 16 + openPanels * 28 + 'px',
+    right: 16 + openPanels * 28 + 'px',
+    width: '240px',
+    zIndex: 1000,
+    background: 'rgba(20, 20, 28, 0.92)',
+    color: '#e8e8f0',
+    font: '11px monospace',
+    border: '1px solid rgba(255, 255, 255, 0.15)',
+    borderRadius: '6px',
+    boxShadow: '0 4px 16px rgba(0, 0, 0, 0.4)',
+    userSelect: 'none',
+  });
+
+  // Title bar: drag to move, click title to collapse, x to close.
+  const header = tweakEl('div', {
+    display: 'flex',
+    alignItems: 'center',
+    padding: '4px 8px',
+    cursor: 'move',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
+  });
+  const title = tweakEl('span', { flex: 1, cursor: 'pointer', fontWeight: 'bold' }, 'tweak: ' + name);
+  const close = tweakEl('span', { cursor: 'pointer', padding: '0 4px', opacity: 0.7 }, 'x');
+  header.append(title, close);
+
+  const body = tweakEl('div', { padding: '6px 8px 8px' });
+  el.append(header, body);
+
+  title.addEventListener('click', () => {
+    body.style.display = body.style.display === 'none' ? '' : 'none';
+  });
+  close.addEventListener('click', () => el.remove());
+
+  header.addEventListener('pointerdown', (e) => {
+    if (e.target !== header) return;
+    const rect = el.getBoundingClientRect();
+    const dx = e.clientX - rect.left;
+    const dy = e.clientY - rect.top;
+    const move = (ev) => {
+      el.style.left = ev.clientX - dx + 'px';
+      el.style.top = ev.clientY - dy + 'px';
+      el.style.right = 'auto';
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  });
+
+  // Sliders
+  for (const p of TWEAK_PARAMS) {
+    if (p.group) {
+      body.append(tweakEl('div', { margin: '6px 0 2px', opacity: 0.5, letterSpacing: '1px' }, p.group));
+      continue;
+    }
+    const row = tweakEl('label', { display: 'flex', alignItems: 'center', gap: '6px', height: '20px' });
+    const label = tweakEl('span', { width: '58px' }, p.key);
+    const input = tweakEl('input', { flex: 1, minWidth: 0, accentColor: '#9f7aea' });
+    const readout = tweakEl('span', { width: '38px', textAlign: 'right' });
+    Object.assign(input, { type: 'range', min: p.min, max: p.max, step: p.step });
+    input.value = values[p.key];
+    readout.textContent = tweakFormat(p, values[p.key]);
+
+    const set = (v) => {
+      values[p.key] = v;
+      input.value = v;
+      readout.textContent = tweakFormat(p, v);
+    };
+    input.addEventListener('input', () => set(parseFloat(input.value)));
+    input.addEventListener('dblclick', () => set(p.value));
+
+    row.append(label, input, readout);
+    body.append(row);
+  }
+
+  // Scope
+  const canvas = tweakEl('canvas', {
+    width: '100%',
+    height: '56px',
+    marginTop: '8px',
+    background: 'rgba(0, 0, 0, 0.35)',
+    borderRadius: '4px',
+    display: 'block',
+  });
+  canvas.width = 448;
+  canvas.height = 112;
+  body.append(canvas);
+
+  document.body.append(el);
+  return { el, body, canvas };
+}
+
+function tweakDrawScopes() {
+  for (const panel of Object.values(window._tweak.panels)) {
+    if (!document.body.contains(panel.el) || panel.body.style.display === 'none') continue;
+    const { canvas } = panel;
+    const g = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+    g.clearRect(0, 0, w, h);
+
+    g.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+    g.beginPath();
+    g.moveTo(0, h / 2);
+    g.lineTo(w, h / 2);
+    g.stroke();
+
+    const data = getAnalyzerData('time', panel.analyserId);
+    if (!data || !data.length) continue;
+
+    // Start at a rising zero crossing so the wave holds still.
+    let start = 0;
+    for (let i = 1; i < data.length / 2; i++) {
+      if (data[i - 1] < 0 && data[i] >= 0) {
+        start = i;
+        break;
+      }
+    }
+    const count = Math.floor(data.length / 2);
+    g.strokeStyle = '#9f7aea';
+    g.lineWidth = 2;
+    g.beginPath();
+    for (let i = 0; i < count; i++) {
+      const x = (i / (count - 1)) * w;
+      const y = h / 2 - data[start + i] * (h / 2) * 0.9;
+      if (i === 0) g.moveTo(x, y);
+      else g.lineTo(x, y);
+    }
+    g.stroke();
+  }
+  requestAnimationFrame(tweakDrawScopes);
+}
+
+if (!window._tweak.drawing) {
+  window._tweak.drawing = true;
+  requestAnimationFrame(tweakDrawScopes);
+}
+
+Pattern.prototype.tweak = function (name) {
+  name = String(name || 'main');
+  const store = window._tweak;
+  let panel = store.panels[name];
+
+  if (!panel || !document.body.contains(panel.el)) {
+    const values = panel
+      ? panel.values
+      : Object.fromEntries(TWEAK_PARAMS.filter((p) => p.key).map((p) => [p.key, p.value]));
+    panel = Object.assign(tweakBuildPanel(name, values), {
+      values,
+      analyserId: 'tweak-' + name,
+    });
+    store.panels[name] = panel;
+  }
+
+  const { values, analyserId } = panel;
+  // Read the sliders each time an event is played.
+  return this.withValue((v) =>
+    v && typeof v === 'object' ? Object.assign({}, v, values, { analyze: analyserId }) : v,
+  );
+};
+
+// @version 1.0

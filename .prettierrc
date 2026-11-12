@@ -1,0 +1,13 @@
+{
+  "singleQuote": true,
+  "overrides": [
+    {
+      "files": "*.strudel",
+      "options": {
+        "parser": "babel"
+      }
+    }
+  ],
+  "jsxSingleQuote": true,
+  "trailingComma": "none"
+}
